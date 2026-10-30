@@ -10,9 +10,16 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram import F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+
+class BookingState(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_phone = State()
+    waiting_for_email = State()
 
 # Загрузка токена из файла .env
 load_dotenv()
@@ -27,6 +34,7 @@ SPREADSHEET_NAME = "База_Годунова_Бот"
 gc = gspread.service_account(filename='credentials.json')
 sh = gc.open(SPREADSHEET_NAME)
 worksheet = sh.sheet1
+worksheet_users = sh.worksheet("Пользователи") # Лист для базы клиентов
 
 # --- Настройки Google Календаря ---
 CALENDAR_ID = 'godunova.tbilisi@gmail.com'
@@ -321,76 +329,115 @@ async def process_date_selection(callback: types.CallbackQuery):
         )
     await callback.answer()
 
-# Обработка выбора времени (создание брони и выдача правил)
+# --- 1. Обработчик выбора времени (Старт сбора данных) ---
 @dp.callback_query(F.data.startswith("time_"))
-async def process_time_selection(callback: types.CallbackQuery):
-    # Разбираем дату и время из callback, например time_2026-10-27_15:00
+async def process_time_selection(callback: types.CallbackQuery, state: FSMContext):
     _, date_str, time_str = callback.data.split("_")
     
-    # Прячем кнопки времени у старого сообщения
     await callback.message.edit_reply_markup(reply_markup=None)
     
-    # Показываем сообщение о загрузке
-    loading_msg = await callback.message.answer("⏳ Создаю предварительную бронь...")
+    # Сохраняем выбранную дату и время
+    await state.update_data(date=date_str, time=time_str)
+    
+    # Включаем режим ожидания имени
+    await state.set_state(BookingState.waiting_for_name)
+    
+    await callback.message.answer(
+        f"✅ Вы выбрали: {date_str} в {time_str} (МСК).\n\n"
+        f"Для завершения бронирования, пожалуйста, напишите ваше **Имя и Фамилию**:",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
 
-    # --- Создание временного события в Google Календаре ---
-    # Высчитываем начало и конец (15 минут на оплату)
+# --- 2. Обработчик ввода имени ---
+@dp.message(BookingState.waiting_for_name)
+async def process_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(BookingState.waiting_for_phone)
+    await message.answer("Отлично! Теперь введите ваш **номер телефона**:")
+
+# --- 3. Обработчик ввода телефона ---
+@dp.message(BookingState.waiting_for_phone)
+async def process_phone(message: types.Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await state.set_state(BookingState.waiting_for_email)
+    await message.answer("И последний шаг: напишите вашу **электронную почту** (на нее придет чек и ссылка на встречу):")
+
+# --- 4. Обработчик ввода Email и финал (Таблица + Календарь + Оплата) ---
+@dp.message(BookingState.waiting_for_email)
+async def process_email(message: types.Message, state: FSMContext):
+    # Достаем все собранные данные
+    user_data = await state.get_data()
+    date_str = user_data['date']
+    time_str = user_data['time']
+    full_name = user_data['name']
+    phone = user_data['phone']
+    email = message.text
+    
+    # Выключаем режим ожидания
+    await state.clear()
+    
+    loading_msg = await message.answer("⏳ Сохраняю данные и создаю бронь...")
+
+    # СОХРАНЕНИЕ В ТАБЛИЦУ USERS
+    current_time = datetime.now(moscow_tz).strftime("%Y-%m-%d %H:%M:%S")
+    user_row = [
+        message.from_user.id,
+        f"@{message.from_user.username}" if message.from_user.username else "Нет",
+        full_name,
+        phone,
+        email,
+        current_time
+    ]
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, worksheet_users.append_row, user_row)
+    except Exception as e:
+        print(f"Ошибка записи в таблицу Пользователи: {e}")
+
+    # СОЗДАНИЕ ВРЕМЕННОЙ БРОНИ В КАЛЕНДАРЕ
     start_time = moscow_tz.localize(datetime.strptime(f"{date_str} {time_str}:00", "%Y-%m-%d %H:%M:%S"))
     end_time = start_time + timedelta(minutes=15)
     
     event = {
-        'summary': f'ОЖИДАЕТ ОПЛАТЫ - {callback.from_user.full_name}',
-        'description': f'Telegram: @{callback.from_user.username or "Нет юзернейма"}',
-        'start': {
-            'dateTime': start_time.isoformat(),
-            'timeZone': 'Europe/Moscow',
-        },
-        'end': {
-            'dateTime': end_time.isoformat(),
-            'timeZone': 'Europe/Moscow',
-        },
-        'colorId': '4' # Красный цвет события для наглядности
+        'summary': f'ОЖИДАЕТ ОПЛАТЫ - {full_name}',
+        'description': f'Telegram: @{message.from_user.username or "Нет"}\nТелефон: {phone}\nEmail: {email}',
+        'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Europe/Moscow'},
+        'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Europe/Moscow'},
+        'colorId': '4' 
     }
 
-    loop = asyncio.get_running_loop()
     try:
-        # Отправляем запрос на создание события
         created_event = await loop.run_in_executor(
             None, 
             lambda: calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
         )
-        # Получаем уникальный ID этого события
         event_id = created_event['id']
     except Exception as e:
         await loading_msg.delete()
-        await callback.message.answer("Произошла ошибка при бронировании в календаре. Попробуйте снова позже.")
-        await callback.answer()
+        await message.answer("Произошла ошибка при бронировании в календаре. Попробуйте снова позже.")
         return
         
     await loading_msg.delete()
     
-    # --- Текст с правилами и кнопка оплаты ---
-    # Я вставил стандартный текст правил. Если у заказчика есть точный текст, просто замените его здесь.
+    # ВЫВОД ПРАВИЛ И КНОПКИ ОПЛАТЫ
     rules_text = (
         f"✅ **Ваша запись предварительно забронирована!**\n\n"
         f"**Дата:** {date_str}\n"
         f"**Время:** {time_str} (МСК)\n\n"
         f"❗️ **Правила переноса и отмены:**\n"
-        f"1. Перенос или отмена консультации возможны не позднее, чем за 24 часа до назначенного времени.\n"
+        f"1. Перенос или отмена возможны не позднее, чем за 24 часа до назначенного времени.\n"
         f"2. При отмене менее чем за 24 часа оплата не возвращается.\n"
         f"3. Опоздание на сессию вычитается из времени консультации.\n\n"
         f"Нажимая кнопку «Оплатить», вы соглашаетесь с этими правилами. У вас есть 15 минут на завершение оплаты."
     )
     
-    # Кнопки Оплаты и Отмены. В кнопку отмены вшиваем event_id, чтобы потом удалить его из календаря
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        # Ссылку на Prodamus пока ставим как заглушку
-        [InlineKeyboardButton(text="💳 Оплатить 3 500 ₽", url="https://prodamus.ru/")], 
+        [InlineKeyboardButton(text="💳 Оплатить 3 500 ₽", url="https://robokassa.com/")], 
         [InlineKeyboardButton(text="❌ Отменить бронь", callback_data=f"cancel_{event_id}")]
     ])
     
-    await callback.message.answer(rules_text, reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
+    await message.answer(rules_text, reply_markup=keyboard, parse_mode="Markdown")
 
 
 # Обработка отмены брони клиентом
