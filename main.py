@@ -8,7 +8,7 @@ import calendar
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, BotCommand
 from aiogram import F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -35,6 +35,7 @@ gc = gspread.service_account(filename='credentials.json')
 sh = gc.open(SPREADSHEET_NAME)
 worksheet = sh.sheet1
 worksheet_users = sh.worksheet("Пользователи") # Лист для базы клиентов
+worksheet_packages = sh.worksheet("Баланс_пакетов") # Лист для учета пакетов
 
 # --- Настройки Google Календаря ---
 CALENDAR_ID = 'godunova.tbilisi@gmail.com'
@@ -50,12 +51,27 @@ moscow_tz = pytz.timezone('Europe/Moscow')
 RU_WEEKDAYS = {0: "ПН", 1: "ВТ", 2: "СР", 3: "ЧТ", 4: "ПТ", 5: "СБ", 6: "ВС"}
 RU_MONTHS = {1: "Янв", 2: "Фев", 3: "Мар", 4: "Апр", 5: "Май", 6: "Июн", 7: "Июл", 8: "Авг", 9: "Сен", 10: "Окт", 11: "Ноя", 12: "Дек"}
 
+# Функция поиска пользователя в таблице
+def get_existing_user(user_id):
+    try:
+        # Получаем все строки из листа (в виде списков)
+        records = worksheet_users.get_all_values()
+        # Идем с конца, чтобы найти самую свежую запись (если их несколько)
+        for row in reversed(records):
+            if str(row[0]) == str(user_id):
+                return {"name": row[2], "phone": row[3], "email": row[4]}
+        return None
+    except Exception as e:
+        print(f"Ошибка при поиске пользователя: {e}")
+        return None
+
 # Главное меню (без "Мои записи" для MVP)
 def get_main_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗓 Разовая сессия", callback_data="catalog_single")],
         [InlineKeyboardButton(text="📚 Пакет сессий", callback_data="catalog_package")],
-        [InlineKeyboardButton(text="💬 Связаться со специалистом", callback_data="contact_specialist")]
+        [InlineKeyboardButton(text="💬 Связаться со специалистом", callback_data="contact_specialist")],
+        [InlineKeyboardButton(text="📖 Правила работы", callback_data="show_rules")]
     ])
     return keyboard
 
@@ -117,11 +133,40 @@ async def cmd_start(message: types.Message):
         reply_markup=get_main_keyboard()
     )
 
-# Обработка нажатий на кнопки
-# Обработка нажатия "Разовая сессия"
+# --- Вывод полных правил ---
+FULL_RULES_TEXT = (
+    "📖 **ПРАВИЛА ЗАПИСИ И ПЕРЕНОСА КОНСУЛЬТАЦИЙ**\n\n"
+    "**1. Запись и бронирование**\n"
+    "1.1. Бронирование даты и времени осуществляется по 100% предоплате.\n"
+    "1.2. Запись считается подтверждённой после поступления полной оплаты.\n\n"
+    "**2. Перенос консультации**\n"
+    "2.1. Бесплатный перенос возможен не позднее чем за 24 часа до назначенного времени.\n"
+    "2.2. При обращении менее чем за 24 часа перенос возможен только по индивидуальному согласованию.\n\n"
+    "**3. Опоздание и неявка**\n"
+    "3.1. При опоздании сессия не продлевается. Она заканчивается в установленное время.\n"
+    "3.2. При неявке без предупреждения время не переносится.\n\n"
+    "**4. Пакеты консультаций**\n"
+    "4.1. Срок начала использования пакета — 3 месяца с даты оплаты.\n"
+    "4.2. Правила переноса распространяются на все встречи из пакета.\n\n"
+    "**5. Форс-мажоры**\n"
+    "Исключительные обстоятельства рассматриваются индивидуально. Если перенос происходит по инициативе специалиста, он бесплатен."
+)
+
+@dp.message(F.text == "/rules")
+async def cmd_rules(message: types.Message):
+    await message.answer(FULL_RULES_TEXT, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "show_rules")
+async def handle_show_rules(callback: types.CallbackQuery):
+    await callback.message.answer(FULL_RULES_TEXT, parse_mode="Markdown")
+    await callback.answer()
+
 # Обработка нажатия "Разовая сессия"
 @dp.callback_query(F.data == "catalog_single")
-async def handle_single_session(callback: types.CallbackQuery):
+async def handle_single_session(callback: types.CallbackQuery, state: FSMContext):
+    # Очищаем память, чтобы точно сбросить выбор пакета, если он был
+    await state.clear()
+    
     text = (
         "🗓 *Разовая сессия*\n\n"
         "Стоимость: 3 500 ₽\n"
@@ -129,12 +174,49 @@ async def handle_single_session(callback: types.CallbackQuery):
         "Выберите удобный день для записи:"
     )
     
-    # Убираем кнопки у предыдущего сообщения (чтобы не засорять чат активными кнопками)
     await callback.message.edit_reply_markup(reply_markup=None)
-    # Отправляем новое сообщение в ленту
     await callback.message.answer(text, reply_markup=get_quick_dates_keyboard(), parse_mode="Markdown")
     await callback.answer()
 
+# --- Обработка нажатия "Пакет сессий" ---
+@dp.callback_query(F.data == "catalog_package")
+async def handle_package_session(callback: types.CallbackQuery):
+    text = (
+        "📚 *Пакет сессий*\n\n"
+        "Покупка пакета — это возможность пройти полноценный курс работы со специалистом по выгодной цене.\n\n"
+        "❗️ **Условия пакета:**\n"
+        "• Пакет действителен 3 месяца с момента оплаты.\n"
+        "• При покупке пакета запись на первую сессию обязательна.\n"
+        "Остальные встречи согласовываются по мере работы.\n\n"
+        "Выберите подходящий тариф:"
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="3 сессии (9 900 ₽)", callback_data="buy_package_3")],
+        [InlineKeyboardButton(text="5 сессий (15 750 ₽)", callback_data="buy_package_5")],
+        [InlineKeyboardButton(text="10 сессий (28 000 ₽)", callback_data="buy_package_10")],
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
+    ])
+    
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+# --- Обработка выбора конкретного пакета ---
+@dp.callback_query(F.data.startswith("buy_package_"))
+async def process_package_selection(callback: types.CallbackQuery, state: FSMContext):
+    package_size = int(callback.data.split("_")[2])
+    
+    # Сохраняем размер выбранного пакета в FSM
+    await state.update_data(package=package_size)
+    
+    await callback.message.edit_reply_markup(reply_markup=None)
+    text = (
+        f"✅ Вы выбрали пакет из {package_size} сессий.\n\n"
+        f"Давайте выберем день для вашей **первой** встречи:"
+    )
+    await callback.message.answer(text, reply_markup=get_quick_dates_keyboard(), parse_mode="Markdown")
+    await callback.answer()
 
 # Обработка кнопки "Назад в меню"
 @dp.callback_query(F.data == "back_to_main")
@@ -329,24 +411,143 @@ async def process_date_selection(callback: types.CallbackQuery):
         )
     await callback.answer()
 
-# --- 1. Обработчик выбора времени (Старт сбора данных) ---
+# Общая функция финализации брони (чтобы не дублировать код)
+# Общая функция финализации брони 
+async def finalize_booking(message: types.Message, state: FSMContext, tg_user, save_to_sheet=True):
+    user_data = await state.get_data()
+    date_str = user_data['date']
+    time_str = user_data['time']
+    full_name = user_data['name']
+    phone = user_data['phone']
+    email = user_data['email']
+    # Достаем размер пакета, если его нет (разовая) - возвращаем None
+    package_size = user_data.get('package', None) 
+    
+    await state.clear()
+    loading_msg = await message.answer("⏳ Создаю бронь в календаре...")
+
+    loop = asyncio.get_running_loop()
+    current_time = datetime.now(moscow_tz).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. Запись контактов в БД
+    if save_to_sheet:
+        user_row = [tg_user.id, f"@{tg_user.username}" if tg_user.username else "Нет", full_name, phone, email, current_time]
+        try:
+            await loop.run_in_executor(None, worksheet_users.append_row, user_row)
+        except Exception as e:
+            print(f"Ошибка записи пользователя: {e}")
+            
+    # 2. Если это пакет, записываем баланс в новую таблицу
+    if package_size:
+        package_row = [tg_user.id, f"@{tg_user.username}" if tg_user.username else "Нет", package_size, package_size]
+        try:
+            await loop.run_in_executor(None, worksheet_packages.append_row, package_row)
+        except Exception as e:
+            print(f"Ошибка записи баланса: {e}")
+
+    # 3. Создание брони в Google Календаре
+    start_time = moscow_tz.localize(datetime.strptime(f"{date_str} {time_str}:00", "%Y-%m-%d %H:%M:%S"))
+    end_time = start_time + timedelta(minutes=15)
+    
+    # Меняем заголовок брони, если это пакет
+    booking_title = f'ОЖИДАЕТ ОПЛАТЫ (Пакет {package_size}) - {full_name}' if package_size else f'ОЖИДАЕТ ОПЛАТЫ - {full_name}'
+    
+    event = {
+        'summary': booking_title,
+        'description': f'Telegram: @{tg_user.username or "Нет"}\nТелефон: {phone}\nEmail: {email}',
+        'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Europe/Moscow'},
+        'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Europe/Moscow'},
+        'colorId': '4' 
+    }
+
+    try:
+        created_event = await loop.run_in_executor(None, lambda: calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute())
+        event_id = created_event['id']
+    except Exception as e:
+        await loading_msg.delete()
+        await message.answer("Произошла ошибка при бронировании. Попробуйте позже.")
+        return
+        
+    await loading_msg.delete()
+    
+    # 4. Выбор суммы для кнопки оплаты
+    prices = {None: "3 500 ₽", 3: "9 900 ₽", 5: "15 750 ₽", 10: "28 000 ₽"}
+    payment_amount = prices.get(package_size)
+    
+    rules_text=(
+        f"✅ **Ваша запись предварительно забронирована!**\n\n"
+        f"**Дата:** {date_str}\n**Время:** {time_str} (МСК)\n\n"
+        f"❗️ **Краткие условия:**\n"
+        f"• Подтверждение брони после 100% предоплаты.\n"
+        f"• Бесплатный перенос возможен строго за 24 часа.\n"
+        f"• При опоздании время сессии не продлевается.\n\n"
+        f"Полные условия доступны по команде /rules или в главном меню.\n"
+        f"Нажимая «Оплатить», вы принимаете правила работы."
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Оплатить {payment_amount}", url="https://robokassa.com/")], 
+        [InlineKeyboardButton(text="❌ Отменить бронь", callback_data=f"cancel_{event_id}")]
+    ])
+    
+    await message.answer(rules_text, reply_markup=keyboard, parse_mode="Markdown")
+
+# --- 1. Обработчик выбора времени (Поиск клиента) ---
 @dp.callback_query(F.data.startswith("time_"))
 async def process_time_selection(callback: types.CallbackQuery, state: FSMContext):
     _, date_str, time_str = callback.data.split("_")
-    
     await callback.message.edit_reply_markup(reply_markup=None)
     
     # Сохраняем выбранную дату и время
     await state.update_data(date=date_str, time=time_str)
     
-    # Включаем режим ожидания имени
-    await state.set_state(BookingState.waiting_for_name)
+    loading_msg = await callback.message.answer("⏳ Проверяю ваши данные...")
     
-    await callback.message.answer(
-        f"✅ Вы выбрали: {date_str} в {time_str} (МСК).\n\n"
-        f"Для завершения бронирования, пожалуйста, напишите ваше **Имя и Фамилию**:",
-        parse_mode="Markdown"
-    )
+    # Ищем пользователя в базе
+    loop = asyncio.get_running_loop()
+    existing_user = await loop.run_in_executor(None, get_existing_user, callback.from_user.id)
+    await loading_msg.delete()
+    
+    if existing_user:
+        # Если нашли, сохраняем эти данные в стейт на случай подтверждения
+        await state.update_data(name=existing_user['name'], phone=existing_user['phone'], email=existing_user['email'])
+        
+        text = (
+            f"✅ Вы выбрали: {date_str} в {time_str} (МСК).\n\n"
+            f"У меня сохранены ваши контактные данные:\n"
+            f"👤 Имя: {existing_user['name']}\n"
+            f"📞 Телефон: {existing_user['phone']}\n"
+            f"✉️ Email: {existing_user['email']}\n\n"
+            f"Используем их для оформления брони?"
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, всё верно", callback_data="confirm_data")],
+            [InlineKeyboardButton(text="✏️ Изменить данные", callback_data="edit_data")]
+        ])
+        await callback.message.answer(text, reply_markup=keyboard)
+    else:
+        # Если новый клиент — стандартный опрос
+        await state.set_state(BookingState.waiting_for_name)
+        await callback.message.answer(
+            f"✅ Вы выбрали: {date_str} в {time_str} (МСК).\n\n"
+            f"Для завершения бронирования, пожалуйста, напишите ваше **Имя и Фамилию**:",
+            parse_mode="Markdown"
+        )
+    await callback.answer()
+
+# --- 1.1 Обработка кнопок "Да, всё верно" и "Изменить данные" ---
+@dp.callback_query(F.data == "confirm_data")
+async def process_confirm_data(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    # Вызываем общую функцию (save_to_sheet=False, так как данные уже есть в базе)
+    await finalize_booking(callback.message, state, callback.from_user, save_to_sheet=False)
+    await callback.answer()
+
+@dp.callback_query(F.data == "edit_data")
+async def process_edit_data(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(BookingState.waiting_for_name)
+    await callback.message.answer("Давайте обновим информацию. Напишите ваше **Имя и Фамилию**:")
     await callback.answer()
 
 # --- 2. Обработчик ввода имени ---
@@ -361,94 +562,22 @@ async def process_name(message: types.Message, state: FSMContext):
 async def process_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=message.text)
     await state.set_state(BookingState.waiting_for_email)
-    await message.answer("И последний шаг: напишите вашу **электронную почту** (на нее придет чек и ссылка на встречу):")
+    await message.answer("И последний шаг: напишите вашу **электронную почту** (на нее придет чек и ссылка):")
 
-# --- 4. Обработчик ввода Email и финал (Таблица + Календарь + Оплата) ---
+# --- 4. Обработчик ввода Email и финал ---
 @dp.message(BookingState.waiting_for_email)
 async def process_email(message: types.Message, state: FSMContext):
-    # Достаем все собранные данные
-    user_data = await state.get_data()
-    date_str = user_data['date']
-    time_str = user_data['time']
-    full_name = user_data['name']
-    phone = user_data['phone']
-    email = message.text
-    
-    # Выключаем режим ожидания
-    await state.clear()
-    
-    loading_msg = await message.answer("⏳ Сохраняю данные и создаю бронь...")
-
-    # СОХРАНЕНИЕ В ТАБЛИЦУ USERS
-    current_time = datetime.now(moscow_tz).strftime("%Y-%m-%d %H:%M:%S")
-    user_row = [
-        message.from_user.id,
-        f"@{message.from_user.username}" if message.from_user.username else "Нет",
-        full_name,
-        phone,
-        email,
-        current_time
-    ]
-    loop = asyncio.get_running_loop()
-    try:
-        await loop.run_in_executor(None, worksheet_users.append_row, user_row)
-    except Exception as e:
-        print(f"Ошибка записи в таблицу Пользователи: {e}")
-
-    # СОЗДАНИЕ ВРЕМЕННОЙ БРОНИ В КАЛЕНДАРЕ
-    start_time = moscow_tz.localize(datetime.strptime(f"{date_str} {time_str}:00", "%Y-%m-%d %H:%M:%S"))
-    end_time = start_time + timedelta(minutes=15)
-    
-    event = {
-        'summary': f'ОЖИДАЕТ ОПЛАТЫ - {full_name}',
-        'description': f'Telegram: @{message.from_user.username or "Нет"}\nТелефон: {phone}\nEmail: {email}',
-        'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Europe/Moscow'},
-        'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Europe/Moscow'},
-        'colorId': '4' 
-    }
-
-    try:
-        created_event = await loop.run_in_executor(
-            None, 
-            lambda: calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        )
-        event_id = created_event['id']
-    except Exception as e:
-        await loading_msg.delete()
-        await message.answer("Произошла ошибка при бронировании в календаре. Попробуйте снова позже.")
-        return
-        
-    await loading_msg.delete()
-    
-    # ВЫВОД ПРАВИЛ И КНОПКИ ОПЛАТЫ
-    rules_text = (
-        f"✅ **Ваша запись предварительно забронирована!**\n\n"
-        f"**Дата:** {date_str}\n"
-        f"**Время:** {time_str} (МСК)\n\n"
-        f"❗️ **Правила переноса и отмены:**\n"
-        f"1. Перенос или отмена возможны не позднее, чем за 24 часа до назначенного времени.\n"
-        f"2. При отмене менее чем за 24 часа оплата не возвращается.\n"
-        f"3. Опоздание на сессию вычитается из времени консультации.\n\n"
-        f"Нажимая кнопку «Оплатить», вы соглашаетесь с этими правилами. У вас есть 15 минут на завершение оплаты."
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить 3 500 ₽", url="https://robokassa.com/")], 
-        [InlineKeyboardButton(text="❌ Отменить бронь", callback_data=f"cancel_{event_id}")]
-    ])
-    
-    await message.answer(rules_text, reply_markup=keyboard, parse_mode="Markdown")
-
+    await state.update_data(email=message.text)
+    # Вызываем общую функцию (save_to_sheet=True, чтобы записать новые данные)
+    await finalize_booking(message, state, message.from_user, save_to_sheet=True)
 
 # Обработка отмены брони клиентом
 @dp.callback_query(F.data.startswith("cancel_"))
 async def cancel_booking(callback: types.CallbackQuery):
-    # Достаем ID события в календаре
     event_id = callback.data.split("_")[1]
     
     await callback.message.edit_reply_markup(reply_markup=None)
     
-    # Удаляем событие из календаря Анастасии
     loop = asyncio.get_running_loop()
     try:
          await loop.run_in_executor(
@@ -456,12 +585,12 @@ async def cancel_booking(callback: types.CallbackQuery):
              lambda: calendar_service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
          )
     except:
-         pass # Игнорируем ошибку, если событие уже как-то удалилось
+         pass 
          
     await callback.message.answer("❌ Ваша бронь успешно отменена. Слот снова свободен.")
-    # Возвращаем главное меню
     await cmd_start(callback.message)
     await callback.answer()
+
 
 # Обработка кнопки "Связаться со специалистом"
 @dp.callback_query(F.data == "contact_specialist")
@@ -483,8 +612,15 @@ async def handle_contact(callback: types.CallbackQuery):
     await callback.message.answer("Для связи со специалистом напишите: @username_psihologa")
     await callback.answer()
 
+async def set_default_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="Открыть главное меню")
+    ]
+    await bot.set_my_commands(commands)
+
 async def main():
     print("Бот запущен...")
+    await set_default_commands(bot)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
