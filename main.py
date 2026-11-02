@@ -411,6 +411,32 @@ async def process_date_selection(callback: types.CallbackQuery):
         )
     await callback.answer()
 
+# Фоновая задача для отмены брони через 15 минут
+async def cancel_unpaid_booking_task(event_id, chat_id, bot_instance):
+    # Ждем 15 минут (900 секунд). Для быстрого теста можете поставить 60 секунд.
+    await asyncio.sleep(60) 
+    
+    # ТУТ В БУДУЩЕМ БУДЕТ ПРОВЕРКА ОПЛАТЫ
+    # Если оплата прошла, мы сделаем return и не будем удалять бронь.
+    # Но пока вебхук Robokassa не подключен, считаем, что оплаты не было, и удаляем слот.
+
+    loop = asyncio.get_running_loop()
+    try:
+        # Пробуем удалить событие.
+        await loop.run_in_executor(
+             None, 
+             lambda: calendar_service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+        )
+        # Уведомляем клиента, что время вышло
+        await bot_instance.send_message(
+            chat_id, 
+            "⏳ Время на оплату (15 минут) истекло. Ваша предварительная бронь отменена, слот снова свободен."
+        )
+    except Exception as e:
+        # Если клиент сам нажал "Отменить бронь" до истечения 15 минут,
+        # Google Календарь выдаст ошибку, так как события уже нет. Мы её просто игнорируем.
+        pass
+
 # Общая функция финализации брони (чтобы не дублировать код)
 # Общая функция финализации брони 
 async def finalize_booking(message: types.Message, state: FSMContext, tg_user, save_to_sheet=True):
@@ -490,7 +516,12 @@ async def finalize_booking(message: types.Message, state: FSMContext, tg_user, s
         [InlineKeyboardButton(text="❌ Отменить бронь", callback_data=f"cancel_{event_id}")]
     ])
     
+
     await message.answer(rules_text, reply_markup=keyboard, parse_mode="Markdown")
+    
+    # Запускаем таймер на 15 минут. 
+    # Передаем event_id, ID чата клиента и объект самого бота
+    asyncio.create_task(cancel_unpaid_booking_task(event_id, message.chat.id, bot))
 
 # --- 1. Обработчик выбора времени (Поиск клиента) ---
 @dp.callback_query(F.data.startswith("time_"))
