@@ -35,7 +35,7 @@ gc = gspread.service_account(filename='credentials.json')
 sh = gc.open(SPREADSHEET_NAME)
 worksheet = sh.sheet1
 worksheet_users = sh.worksheet("Пользователи") # Лист для базы клиентов
-worksheet_packages = sh.worksheet("Баланс_пакетов") # Лист для учета пакетов
+worksheet_transactions = sh.worksheet("Транзакции") # Единый лист транзакций
 
 # --- Настройки Google Календаря ---
 CALENDAR_ID = 'godunova.tbilisi@gmail.com'
@@ -64,6 +64,22 @@ def get_existing_user(user_id):
     except Exception as e:
         print(f"Ошибка при поиске пользователя: {e}")
         return None
+
+# Универсальная функция логирования действий
+async def log_user_action(user: types.User, action: str):
+    current_time = datetime.now(moscow_tz).strftime("%Y-%m-%d %H:%M:%S")
+    row_data = [
+        user.id,
+        user.username or "Нет",
+        user.full_name,
+        action,
+        current_time
+    ]
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, worksheet.append_row, row_data)
+    except Exception as e:
+        print(f"Ошибка логирования действия {action}: {e}")
 
 # Главное меню (без "Мои записи" для MVP)
 def get_main_keyboard():
@@ -156,12 +172,14 @@ async def cmd_rules(message: types.Message):
 
 @dp.callback_query(F.data == "show_rules")
 async def handle_show_rules(callback: types.CallbackQuery):
+    await log_user_action(callback.from_user, "Просмотр правил")
     await callback.message.answer(FULL_RULES_TEXT, parse_mode="Markdown")
     await callback.answer()
 
 # Обработка нажатия "Разовая сессия"
 @dp.callback_query(F.data == "catalog_single")
 async def handle_single_session(callback: types.CallbackQuery, state: FSMContext):
+    await log_user_action(callback.from_user, "Выбор: Разовая сессия")
     # Очищаем память, чтобы точно сбросить выбор пакета, если он был
     await state.clear()
     
@@ -180,6 +198,8 @@ async def handle_single_session(callback: types.CallbackQuery, state: FSMContext
 # --- Обработка нажатия "Пакет сессий" ---
 @dp.callback_query(F.data == "catalog_package")
 async def handle_package_session(callback: types.CallbackQuery):
+    await log_user_action(callback.from_user, "Выбор: Пакет сессий")
+
     text = (
         "📚 *Пакет сессий*\n\n"
         "Покупка пакета — это возможность пройти полноценный курс работы со специалистом по выгодной цене.\n\n"
@@ -205,7 +225,7 @@ async def handle_package_session(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("buy_package_"))
 async def process_package_selection(callback: types.CallbackQuery, state: FSMContext):
     package_size = int(callback.data.split("_")[2])
-    
+    await log_user_action(callback.from_user, f"Выбран пакет: {package_size} сессий")
     # Сохраняем размер выбранного пакета в FSM
     await state.update_data(package=package_size)
     
@@ -438,6 +458,7 @@ async def cancel_unpaid_booking_task(event_id, chat_id, bot_instance):
 
 # Общая функция финализации брони (чтобы не дублировать код)
 # Общая функция финализации брони 
+# Общая функция финализации брони 
 async def finalize_booking(message: types.Message, state: FSMContext, tg_user, save_to_sheet=True):
     user_data = await state.get_data()
     date_str = user_data['date']
@@ -445,7 +466,6 @@ async def finalize_booking(message: types.Message, state: FSMContext, tg_user, s
     full_name = user_data['name']
     phone = user_data['phone']
     email = user_data['email']
-    # Достаем размер пакета, если его нет (разовая) - возвращаем None
     package_size = user_data.get('package', None) 
     
     await state.clear()
@@ -461,20 +481,11 @@ async def finalize_booking(message: types.Message, state: FSMContext, tg_user, s
             await loop.run_in_executor(None, worksheet_users.append_row, user_row)
         except Exception as e:
             print(f"Ошибка записи пользователя: {e}")
-            
-    # 2. Если это пакет, записываем баланс в новую таблицу
-    if package_size:
-        package_row = [tg_user.id, f"@{tg_user.username}" if tg_user.username else "Нет", package_size, package_size]
-        try:
-            await loop.run_in_executor(None, worksheet_packages.append_row, package_row)
-        except Exception as e:
-            print(f"Ошибка записи баланса: {e}")
 
-    # 3. Создание брони в Google Календаре
+    # 2. Создание брони в Google Календаре
     start_time = moscow_tz.localize(datetime.strptime(f"{date_str} {time_str}:00", "%Y-%m-%d %H:%M:%S"))
     end_time = start_time + timedelta(minutes=15)
     
-    # Меняем заголовок брони, если это пакет
     booking_title = f'ОЖИДАЕТ ОПЛАТЫ (Пакет {package_size}) - {full_name}' if package_size else f'ОЖИДАЕТ ОПЛАТЫ - {full_name}'
     
     event = {
@@ -495,9 +506,25 @@ async def finalize_booking(message: types.Message, state: FSMContext, tg_user, s
         
     await loading_msg.delete()
     
-    # 4. Выбор суммы для кнопки оплаты
+    # 3. Выбор суммы для кнопки оплаты
     prices = {None: "3 500 ₽", 3: "10 100 ₽", 5: "16 800 ₽", 10: "33 200 ₽"}
     payment_amount = prices.get(package_size)
+
+    # 4. Фиксация транзакции со статусом "Ожидает оплаты"
+    service_type = f"Пакет {package_size}" if package_size else "Разовая"
+    transaction_row = [
+        tg_user.id,
+        f"@{tg_user.username}" if tg_user.username else "Нет",
+        service_type,
+        payment_amount,
+        current_time,
+        "Ожидает оплаты",
+        event_id
+    ]
+    try:
+        await loop.run_in_executor(None, worksheet_transactions.append_row, transaction_row)
+    except Exception as e:
+        print(f"Ошибка записи транзакции: {e}")
     
     rules_text=(
         f"✅ **Ваша запись предварительно забронирована!**\n\n"
@@ -515,11 +542,9 @@ async def finalize_booking(message: types.Message, state: FSMContext, tg_user, s
         [InlineKeyboardButton(text="❌ Отменить бронь", callback_data=f"cancel_{event_id}")]
     ])
     
-
     await message.answer(rules_text, reply_markup=keyboard, parse_mode="Markdown")
     
-    # Запускаем таймер на 15 минут. 
-    # Передаем event_id, ID чата клиента и объект самого бота
+    # Запускаем таймер
     asyncio.create_task(cancel_unpaid_booking_task(event_id, message.chat.id, bot))
 
 # --- 1. Обработчик выбора времени (Поиск клиента) ---
